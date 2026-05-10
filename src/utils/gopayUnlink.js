@@ -173,15 +173,14 @@ async function unlinkOpenAIFromGoPay(adb, device, tag) {
     await adbShell(adb, device, ['input', 'tap', String(profileEl.cx), String(profileEl.cy)]);
     await sleep(2000);
 
-    // Step 4: Tap Account & app settings
-    // tap settings;
-    ok = await tapByDesc(adb, device, 'Account', { clickable: true });
+    // Step 4: Tap "Account & app settings"
+    let ok = await tapByDesc(adb, device, 'app settings', { clickable: true });
     if (!ok) {
-      logger.warn(t + 'GoPay Unlink: Account settings not found, retrying...');
+      logger.warn(t + 'GoPay Unlink: Account & app settings not found, retrying...');
       await sleep(2000);
-      ok = await tapByDesc(adb, device, 'Account', { clickable: true });
+      ok = await tapByDesc(adb, device, 'app settings', { clickable: true });
       if (!ok) {
-        logger.error(t + 'GoPay Unlink: Account settings not found');
+        logger.error(t + 'GoPay Unlink: Account & app settings not found');
         await killGoPay(adb, device);
         return false;
       }
@@ -198,8 +197,8 @@ async function unlinkOpenAIFromGoPay(adb, device, tag) {
     }
     await sleep(2000);
 
-    // Check: already unlinked?
-    const xmlCheck = await getXml(adb, device);
+    // Poll for OpenAI to appear (may take time after payment settles)
+    let xmlCheck = await getXml(adb, device);
     if (findByDesc(xmlCheck, 'No apps linked')) {
       logger.success(t + 'GoPay Unlink: Already unlinked ✓');
       await killGoPay(adb, device);
@@ -207,10 +206,32 @@ async function unlinkOpenAIFromGoPay(adb, device, tag) {
     }
 
     if (!findByDesc(xmlCheck, 'OpenAI')) {
-      logger.warn(t + 'GoPay Unlink: OpenAI LLC not found on Linked apps page');
-      await killGoPay(adb, device);
-      return false;
+      logger.info(t + 'GoPay Unlink: Waiting for OpenAI to appear on Linked apps...');
+      let found = false;
+      for (let poll = 0; poll < 6; poll++) {
+        await sleep(5000);
+        // Re-tap Linked apps to refresh
+        await tapByDesc(adb, device, 'Linked apps', { clickable: true });
+        await sleep(2000);
+        xmlCheck = await getXml(adb, device);
+        if (findByDesc(xmlCheck, 'No apps linked')) {
+          logger.success(t + 'GoPay Unlink: Already unlinked ✓');
+          await killGoPay(adb, device);
+          return true;
+        }
+        if (findByDesc(xmlCheck, 'OpenAI')) {
+          found = true;
+          break;
+        }
+        logger.info(t + 'GoPay Unlink: Poll ' + (poll + 1) + '/6...');
+      }
+      if (!found) {
+        logger.warn(t + 'GoPay Unlink: OpenAI LLC not found after 30s polling');
+        await killGoPay(adb, device);
+        return false;
+      }
     }
+
 
     // Step 6: Tap Unlink button (first/top one)
     // tap unlink;

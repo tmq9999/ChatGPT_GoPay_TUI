@@ -358,13 +358,19 @@ class ChatGPTAutopay {
       ...this._oaiHeaders(),
       ...b
     }, c);
-    for (let f = 0; f < 2; f++) {
+    for (let f = 0; f < 3; f++) {
       try {
         const g = await this._cycleTLS(a, d, 'get');
         this._oaiJar.capture(g.headers, g.finalUrl || a);
+        if (g.status === 0 && f < 2) {
+          this.log.warn('HTTP 0 on GET, reinit CycleTLS & retry ' + (f + 1) + '...');
+          try { this._cycleTLS = await initCycleTLS(); } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
         return { 'status': g.status, 'data': this._parseBody(g.data), 'headers': g.headers };
       } catch (h) {
-        if (f === 0 && h.message?.includes('toLowerCase')) {
+        if (f < 2 && (h.message?.includes('toLowerCase') || h.message?.includes('ECONNRESET'))) {
           this.log.warn('CycleTLS reinit...');
           try { this._cycleTLS = await initCycleTLS(); } catch {}
           continue;
@@ -384,13 +390,19 @@ class ChatGPTAutopay {
       ...c
     }, d);
     f.body = typeof b === 'string' ? b : JSON.stringify(b);
-    for (let g = 0; g < 2; g++) {
+    for (let g = 0; g < 3; g++) {
       try {
         const h = await this._cycleTLS(a, f, 'post');
         this._oaiJar.capture(h.headers, h.finalUrl || a);
+        if (h.status === 0 && g < 2) {
+          this.log.warn('HTTP 0 on POST, reinit CycleTLS & retry ' + (g + 1) + '...');
+          try { this._cycleTLS = await initCycleTLS(); } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
         return { 'status': h.status, 'data': this._parseBody(h.data), 'headers': h.headers };
       } catch (i) {
-        if (g === 0 && i.message?.includes('toLowerCase')) {
+        if (g < 2 && (i.message?.includes('toLowerCase') || i.message?.includes('ECONNRESET'))) {
           this.log.warn('CycleTLS reinit...');
           try { this._cycleTLS = await initCycleTLS(); } catch {}
           continue;
@@ -410,13 +422,19 @@ class ChatGPTAutopay {
       'upgrade-insecure-requests': '1',
       ...b
     });
-    for (let d = 0; d < 2; d++) {
+    for (let d = 0; d < 3; d++) {
       try {
         const f = await this._cycleTLS(a, c, 'get');
         this._oaiJar.capture(f.headers, f.finalUrl || a);
+        if (f.status === 0 && d < 2) {
+          this.log.warn('HTTP 0 on HTML GET, reinit CycleTLS & retry ' + (d + 1) + '...');
+          try { this._cycleTLS = await initCycleTLS(); } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
         return { 'status': f.status, 'data': f.data, 'headers': f.headers };
       } catch (g) {
-        if (d === 0 && g.message?.includes('toLowerCase')) {
+        if (d < 2 && (g.message?.includes('toLowerCase') || g.message?.includes('ECONNRESET'))) {
           this.log.warn('CycleTLS reinit...');
           try { this._cycleTLS = await initCycleTLS(); } catch {}
           continue;
@@ -485,9 +503,17 @@ class ChatGPTAutopay {
         'sec-fetch-site': 'same-origin',
         ...l
       });
-      const n = await this._cycleTLS(k, m, 'get');
-      b.capture(n.headers, n.finalUrl || k);
-      return n;
+      for (let _r = 0; _r < 3; _r++) {
+        const n = await this._cycleTLS(k, m, 'get');
+        b.capture(n.headers, n.finalUrl || k);
+        if (n.status === 0 && _r < 2) {
+          this.log.warn('HTTP 0 (login GET), reinit & retry ' + (_r + 1) + '...');
+          try { this._cycleTLS = await initCycleTLS(); } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        return n;
+      }
     };
     const g = async (k, l = {}) => {
       const m = d(k, {
@@ -499,9 +525,17 @@ class ChatGPTAutopay {
         'upgrade-insecure-requests': '1',
         ...l
       });
-      const n = await this._cycleTLS(k, m, 'get');
-      b.capture(n.headers, n.finalUrl || k);
-      return n;
+      for (let _r = 0; _r < 3; _r++) {
+        const n = await this._cycleTLS(k, m, 'get');
+        b.capture(n.headers, n.finalUrl || k);
+        if (n.status === 0 && _r < 2) {
+          this.log.warn('HTTP 0 (login HTML), reinit & retry ' + (_r + 1) + '...');
+          try { this._cycleTLS = await initCycleTLS(); } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        return n;
+      }
     };
     const h = async (k, l, m = {}) => {
       const n = d(k, {
@@ -512,9 +546,17 @@ class ChatGPTAutopay {
         ...m
       });
       n.body = typeof l === 'string' ? l : JSON.stringify(l);
-      const o = await this._cycleTLS(k, n, 'post');
-      b.capture(o.headers, o.finalUrl || k);
-      return o;
+      for (let _r = 0; _r < 3; _r++) {
+        const o = await this._cycleTLS(k, n, 'post');
+        b.capture(o.headers, o.finalUrl || k);
+        if (o.status === 0 && _r < 2) {
+          this.log.warn('HTTP 0 (login POST), reinit & retry ' + (_r + 1) + '...');
+          try { this._cycleTLS = await initCycleTLS(); } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        return o;
+      }
     };
     const i = async (k, l = 15) => {
       let m = k;
@@ -1476,19 +1518,6 @@ class ChatGPTAutopay {
         await this.checkTransactionStatus();
         this.log.info('Verify checkout...');
         await this.verifyCheckout();
-        if (this.adbPath && this.deviceSerial) {
-          this.log.info('Unlinking GoPay (OpenAI LLC)...');
-          try {
-            const h = await unlinkOpenAIFromGoPay(this.adbPath, this.deviceSerial, this.tag);
-            if (h) {
-              this.log.success('GoPay unlinked \u2713');
-            } else {
-              this.log.warn('GoPay unlink: operation completed but confirmation unclear');
-            }
-          } catch (i) {
-            this.log.warn('GoPay unlink failed: ' + i.message?.substring(0, 100));
-          }
-        }
       }
       const e = await this.checkSubscriptionStatus();
       return {
@@ -1515,7 +1544,33 @@ class ChatGPTAutopay {
         'gopayLinked': m
       };
     } finally {
-      // Always force-close GoPay + WhatsApp on emulator so next thread can use it
+      // Always try to unlink GoPay BEFORE force-stopping apps
+      if (this.adbPath && this.deviceSerial && this._gopayLinked) {
+        this.log.info('Unlinking GoPay before releasing device...');
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const unlinkResult = await unlinkOpenAIFromGoPay(this.adbPath, this.deviceSerial, this.tag);
+            if (unlinkResult) {
+              this.log.success('GoPay unlinked ✓ (finally)');
+              break;
+            } else if (attempt < 2) {
+              this.log.warn('GoPay unlink unclear, retrying in 10s...');
+              await sleep(10000);
+            } else {
+              this.log.warn('GoPay unlink: all attempts failed in finally block');
+            }
+          } catch (unlinkErr) {
+            if (attempt < 2) {
+              this.log.warn('GoPay unlink error, retrying in 10s...');
+              await sleep(10000);
+            } else {
+              this.log.warn('GoPay unlink failed (finally): ' + unlinkErr.message?.substring(0, 80));
+            }
+          }
+        }
+      }
+
+      // Force-close GoPay + WhatsApp on emulator so next thread can use it
       if (this.adbPath && this.deviceSerial) {
         try {
           const { execFile } = require('child_process');

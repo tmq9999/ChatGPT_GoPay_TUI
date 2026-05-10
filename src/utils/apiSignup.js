@@ -100,9 +100,24 @@ class TLSSession {
       'sec-fetch-site': 'same-origin',
       ...extraHeaders
     });
-    const res = await this.tls(url, opts, 'get');
-    this.jar.capture(res.headers, res.finalUrl || url);
-    return res;
+    for (let _r = 0; _r < 3; _r++) {
+      try {
+        const res = await this.tls(url, opts, 'get');
+        this.jar.capture(res.headers, res.finalUrl || url);
+        if (res.status === 0 && _r < 2) {
+          try { this.tls = await initCycleTLS(); } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        return res;
+      } catch (e) {
+        if (_r < 2 && (e.message?.includes('toLowerCase') || e.message?.includes('ECONNRESET'))) {
+          try { this.tls = await initCycleTLS(); } catch {}
+          continue;
+        }
+        throw e;
+      }
+    }
   }
 
   async getHtml(url, extraHeaders = {}) {
@@ -115,9 +130,24 @@ class TLSSession {
       'upgrade-insecure-requests': '1',
       ...extraHeaders
     });
-    const res = await this.tls(url, opts, 'get');
-    this.jar.capture(res.headers, res.finalUrl || url);
-    return res;
+    for (let _r = 0; _r < 3; _r++) {
+      try {
+        const res = await this.tls(url, opts, 'get');
+        this.jar.capture(res.headers, res.finalUrl || url);
+        if (res.status === 0 && _r < 2) {
+          try { this.tls = await initCycleTLS(); } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        return res;
+      } catch (e) {
+        if (_r < 2 && (e.message?.includes('toLowerCase') || e.message?.includes('ECONNRESET'))) {
+          try { this.tls = await initCycleTLS(); } catch {}
+          continue;
+        }
+        throw e;
+      }
+    }
   }
 
   async post(url, body, extraHeaders = {}) {
@@ -129,9 +159,24 @@ class TLSSession {
       ...extraHeaders
     });
     opts.body = typeof body === 'string' ? body : JSON.stringify(body);
-    const res = await this.tls(url, opts, 'post');
-    this.jar.capture(res.headers, res.finalUrl || url);
-    return res;
+    for (let _r = 0; _r < 3; _r++) {
+      try {
+        const res = await this.tls(url, opts, 'post');
+        this.jar.capture(res.headers, res.finalUrl || url);
+        if (res.status === 0 && _r < 2) {
+          try { this.tls = await initCycleTLS(); } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        return res;
+      } catch (e) {
+        if (_r < 2 && (e.message?.includes('toLowerCase') || e.message?.includes('ECONNRESET'))) {
+          try { this.tls = await initCycleTLS(); } catch {}
+          continue;
+        }
+        throw e;
+      }
+    }
   }
 
   async followRedirects(startUrl, extraHeaders = {}, maxRedirects = 15) {
@@ -423,7 +468,7 @@ async function runSignupViaAPI(proxyUrl, {
 
         const addPwOpts = {
           ja3: CHROME_JA3, http2Fingerprint: CHROME_H2, userAgent: CHROME_UA,
-          timeout: 60, proxy: session.proxy, enableConnectionReuse: true,
+          timeout: 30, proxy: session.proxy, disableRedirect: true,
           headers: {
             ...addPwHeaders,
             ...(session.jar.headerFor(addPwUrl) ? { Cookie: session.jar.headerFor(addPwUrl) } : {}),
@@ -477,7 +522,7 @@ async function runSignupViaAPI(proxyUrl, {
 
     return { success: true, accessToken, sessionData, sessionToken: sessionData?.sessionToken || sessionToken };
   } finally {
-    await session.close();
+    if (_ownTls) await session.close();
   }
 }
 

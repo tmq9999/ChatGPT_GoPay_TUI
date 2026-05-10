@@ -105,8 +105,45 @@ function getUserInput(prompt) {
   }));
 }
 
+// ── Device Pool (Semaphore for MuMu devices) ──────────────────────────
 
+class DevicePool {
+  constructor(devices) {
+    this._devices = devices.map(d => ({ ...d, _busy: false }));
+    this._waiters = [];
+  }
 
+  acquire(timeoutMs = 300000) {
+    const free = this._devices.find(d => !d._busy);
+    if (free) {
+      free._busy = true;
+      return Promise.resolve(free);
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this._waiters.findIndex(w => w.resolve === resolve);
+        if (idx >= 0) this._waiters.splice(idx, 1);
+        reject(new Error('Device acquire timeout (' + (timeoutMs / 1000) + 's)'));
+      }, timeoutMs);
+      this._waiters.push({ resolve, timer });
+    });
+  }
+
+  release(device) {
+    device._busy = false;
+    if (this._waiters.length > 0) {
+      device._busy = true;
+      const { resolve, timer } = this._waiters.shift();
+      clearTimeout(timer);
+      resolve(device);
+    }
+  }
+
+  status() {
+    const busy = this._devices.filter(d => d._busy).length;
+    return { busy, free: this._devices.length - busy, total: this._devices.length };
+  }
+}
 
 function printConfig(accounts, proxies, mode, threadCount) {
   console.log('  Mode        ' + C.green + mode + C.reset);
@@ -320,140 +357,240 @@ async function runSingleSignup(hotmailAccount, proxyUrl, threadId, cycleTLS) {
   return { success: false, email: hotmailAccount.email, error: 'All retries exhausted' };
 }
 
-// ── Multi-Thread Signup ────────────────────────────────────────────────
+// ── Multi-Thread Signup (Async Concurrency — 1 CycleTLS) ───────────────
 
 async function runMultiThread(accounts, proxies, threadCount) {
   printConfig(accounts, proxies, 'Multi-Thread', threadCount);
   console.log('');
 
+  const initCycleTLS = require('cycletls');
+  const { v4: uuidv4 } = require('uuid');
+  const { waitForOtp, snapshotExistingUids, getMessages } = require('./utils/hotmailReader');
+  const { generateRandomName, generateRandomBirthday } = require('./utils/emailGenerator');
+  const { generateSentinelTokens } = require('./utils/sentinelToken');
+  const { enable2FAAPI } = require('./utils/twoFactorSetup');
+  const { runSignupViaAPI } = require('./utils/apiSignup');
+
   const total = accounts.length;
   let successCount = 0;
   let failCount = 0;
   let completedCount = 0;
-  let taskIndex = 0;
 
-  const workerPath = path.join(__dirname, 'worker.js');
-  const activeWorkers = new Map();
-  const freeSlots = []; // available thread slots
-  for (let i = threadCount; i >= 1; i--) freeSlots.push(i);
+  // CycleTLS Pool — 1 instance per 3 threads, min 2, max 5
+  const poolSize = Math.max(2, Math.min(5, Math.ceil(threadCount / 3)));
+  logger.info('Initializing CycleTLS pool (' + poolSize + ' instances)...');
+  const tlsPool = [];
+  for (let i = 0; i < poolSize; i++) {
+    tlsPool.push({ tls: await initCycleTLS(), uses: 0, id: i });
+  }
+  let _poolRobin = 0;
+  const TLS_RECYCLE_AFTER = 10; // recycle instance after N uses
+  logger.info('CycleTLS pool ready (' + poolSize + ')');
 
-  // COLOR_RULE.md colors
-  const LEVEL_COLORS = {
-    info:    '\x1b[96m',
-    success: '\x1b[92m',
-    warn:    '\x1b[93m',
-    error:   '\x1b[91m',
-  };
-  const R = '\x1b[0m';
+  function getTLS() {
+    const entry = tlsPool[_poolRobin % poolSize];
+    _poolRobin++;
+    return entry;
+  }
 
-  return new Promise(resolve => {
-    function mts() {
-      const d = new Date();
-      return String(d.getHours()).padStart(2, '0') + ':' +
-             String(d.getMinutes()).padStart(2, '0') + ':' +
-             String(d.getSeconds()).padStart(2, '0');
+  async function releaseTLS(entry) {
+    entry.uses++;
+    if (entry.uses >= TLS_RECYCLE_AFTER) {
+      try { await entry.tls.exit(); } catch {}
+      entry.tls = await initCycleTLS();
+      entry.uses = 0;
     }
+  }
 
-    // Formatted log for multi-thread main process
-    function mlog(slot, email, step, msg, level) {
-      const color = LEVEL_COLORS[level] || LEVEL_COLORS.info;
-      console.log(color + '[' + mts() + '] - [#T' + slot + '] - [' + email + '] - [' + step + '] - ' + msg + R);
-    }
+  async function runOneSignup(account, proxyUrl, slot) {
+    const log = logger.withContext(slot, account.email);
+    const tlsEntry = getTLS();
+    const cycleTLS = tlsEntry.tls;
 
-    function spawnWorker() {
-      if (taskIndex >= total || freeSlots.length === 0) return;
+    try {
+      log.info('📧 Bắt đầu');
 
-      const slot = freeSlots.pop(); // Take a free slot
-      const idx = taskIndex++;
-      const account = accounts[idx];
-      const proxyUrl = assignProxy(proxies, idx);
+      // Snapshot existing emails
+      const existingMessages = await getMessages(
+        account.email, account.refreshToken, account.clientId
+      );
+      const seenUids = snapshotExistingUids(existingMessages);
+      const usedCodes = new Set();
+      if (Array.isArray(existingMessages)) {
+        for (const msg of existingMessages) {
+          const body = msg.body || msg.bodyPreview || msg.subject || '';
+          const m = body.match(/\b(\d{6})\b/);
+          if (m) usedCodes.add(m[1]);
+        }
+      }
 
-      mlog(slot, account.email, '-', '📧 Bắt đầu', 'info');
+      const maxAttempts = retries || 3;
+      let result;
 
-      const worker = new Worker(workerPath, {
-        workerData: {
-          hotmailAccount: account,
-          proxyUrl,
-          threadId: slot,
-          chatgptPassword: password,
-          retries,
-        },
-      });
-
-      activeWorkers.set(slot, worker);
-      _activeWorkerSet.add(worker);
-
-      worker.on('message', msg => {
-        if (msg.type === 'result') {
-          if (msg.success) {
-            fileWriter.writeResultToXlsx({
-              email: msg.email,
-              chatgptPassword: password,
-              twoFa: msg.twoFaSecret || '',
-              sessionData: msg.sessionData || null,
-              hotmailInfo: msg.hotmailInfo || null,
-              status: 'SUCCESS',
-            });
-            fileWriter.removeFromHotmailXlsx(msg.email, hotmailFile);
-            mlog(slot, msg.email, '-', '✅ Saved to xlsx', 'success');
-            successCount++;
-          } else {
-            // Remove already-registered emails from source
-            if (msg.error && msg.error.includes('already registered')) {
-              fileWriter.removeFromHotmailXlsx(msg.email, hotmailFile);
-            }
-            // Worker đã log ❌ rồi ─ không log lại 💥 đây
-            failCount++;
-          }
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (attempt > 0) {
+          log.warn('Retry ' + attempt + '/' + (maxAttempts - 1));
+          await new Promise(r => setTimeout(r, 2000));
         }
 
-        if (msg.type === 'done') {
-          completedCount++;
-          activeWorkers.delete(slot);
-          _activeWorkerSet.delete(worker);
-          freeSlots.push(slot);
-          printProgress(successCount, failCount, completedCount, total);
+        const deviceId = attempt > 0 ? uuidv4() : uuidv4();
+        const sessionId = uuidv4();
+        const sentinelId = uuidv4();
+        const name = generateRandomName();
+        const birthdate = generateRandomBirthday().full;
 
-          spawnWorker();
+        try {
+          result = await runSignupViaAPI(proxyUrl, {
+            email: account.email,
+            password: password,
+            name, birthdate, deviceId, sessionId,
+            sharedCycleTLS: cycleTLS,
+            sentinelFn: async (flow, cookies, tlsFn) => {
+              try {
+                return await generateSentinelTokens(proxyUrl, '', flow, sentinelId, tlsFn || cycleTLS);
+              } catch { return null; }
+            },
+            otpFn: async () => {
+              if (!seenUids._usedCodes) seenUids._usedCodes = new Set();
+              for (const c of usedCodes) seenUids._usedCodes.add(c);
+              const otp = await waitForOtp(account.email, account.refreshToken, account.clientId, 120, seenUids);
+              if (otp) usedCodes.add(String(otp));
+              return otp;
+            },
+            onStep: step => {
+              // Extract [X/7] from step message
+              const sm = step.match(/^\[(\d+\/\d+)\]\s*/);
+              if (sm) {
+                const s = sm[1], msg = step.substring(sm[0].length);
+                const level = msg.includes('❌') ? 'error' : msg.includes('⚠️') ? 'warn' : msg.includes('✅') || msg.includes('OK') ? 'success' : 'info';
+                log[level]('[' + s + '] ' + msg);
+              } else {
+                log.info(step);
+              }
+            },
+          });
+        } catch (e) {
+          const msg = e.message?.includes('socket') || e.message?.includes('ECONN') || e.message?.includes('ETIMEDOUT')
+            ? 'Network error' : e.message;
+          if (attempt < maxAttempts - 1) {
+            log.warn('⚠️ ' + msg);
+            continue;
+          }
+          log.error('❌ ' + msg);
+          failCount++;
+          return;
+        }
 
-          if (completedCount >= total) {
+        if (result.success) {
+          const accessToken = result.accessToken || result.sessionData?.accessToken || '';
+
+          // 2FA
+          let twoFaSecret = '';
+          if (accessToken) {
+            try {
+              const secret = await enable2FAAPI(accessToken, proxyUrl, account.email, cycleTLS);
+              if (secret) {
+                twoFaSecret = secret;
+                log.success('[6/7] 🔐 2FA: ' + secret);
+              } else {
+                log.warn('[6/7] ⚠️ 2FA failed');
+              }
+            } catch (e) {
+              log.error('[6/7] ❌ 2FA: ' + e.message);
+            }
+          }
+
+          log.success('[7/7] ✅ Done');
+          fileWriter.writeResultToXlsx({
+            email: account.email,
+            chatgptPassword: password,
+            twoFa: twoFaSecret,
+            sessionData: result.sessionData || null,
+            hotmailInfo: account,
+            status: 'SUCCESS',
+          });
+          fileWriter.removeFromHotmailXlsx(account.email, hotmailFile);
+          successCount++;
+          return;
+        }
+
+        // Handle failure
+        const { step, error, data } = result;
+        let errorMsg = error || '';
+        try {
+          const parsed = typeof data === 'object' ? data : JSON.parse(error);
+          errorMsg = parsed?.error?.message || parsed?.detail || parsed?.message || error;
+        } catch {}
+
+        const noRetryMsg = (errorMsg || '').toLowerCase();
+        if (noRetryMsg.includes('already registered') || noRetryMsg.includes('already exists')) {
+          log.warn('⏩ Already registered');
+          fileWriter.removeFromHotmailXlsx(account.email, hotmailFile);
+          failCount++;
+          return;
+        }
+        if (step === 'otp') {
+          log.error('❌ OTP timeout');
+          failCount++;
+          return;
+        }
+        if (step === 'create_account' && data?.error?.code === 'unsupported_country') {
+          log.error('❌ Country not supported');
+          failCount++;
+          return;
+        }
+
+        if (attempt >= maxAttempts - 1) {
+          log.error('❌ ' + (step || '?') + ': ' + (errorMsg || 'All retries exhausted'));
+          failCount++;
+          return;
+        }
+        log.warn('⚠️ ' + (step || '?') + ': ' + errorMsg);
+      }
+
+      failCount++;
+    } catch (e) {
+      logger.withContext(slot, account.email).error('💥 Fatal: ' + e.message);
+      failCount++;
+    } finally {
+      completedCount++;
+      await releaseTLS(tlsEntry);
+      printProgress(successCount, failCount, completedCount, total);
+    }
+  }
+
+  // Semaphore: run N tasks concurrently
+  const running = new Set();
+  let taskIndex = 0;
+
+  await new Promise(resolve => {
+    function next() {
+      while (running.size < threadCount && taskIndex < total) {
+        const idx = taskIndex++;
+        const slot = (idx % threadCount) + 1;
+        const proxyUrl = assignProxy(proxies, idx);
+        const task = runOneSignup(accounts[idx], proxyUrl, slot).then(() => {
+          running.delete(task);
+          if (taskIndex < total) next();
+          if (running.size === 0 && taskIndex >= total) {
             printSummary(successCount, failCount, total);
             resolve();
           }
-        }
-      });
-
-      worker.on('error', err => {
-        mlog(slot, account.email, '-', '💥 ' + err.message, 'error');
-        failCount++;
-        completedCount++;
-        activeWorkers.delete(slot);
-        _activeWorkerSet.delete(worker);
-        freeSlots.push(slot);
-        printProgress(successCount, failCount, completedCount, total);
-
-        spawnWorker();
-
-        if (completedCount >= total) {
-          printSummary(successCount, failCount, total);
-          resolve();
-        }
-      });
-
-      worker.on('exit', code => {
-        if (code !== 0 && activeWorkers.has(slot)) {
-          activeWorkers.delete(slot);
-          if (!freeSlots.includes(slot)) freeSlots.push(slot);
-        }
-      });
+        });
+        running.add(task);
+      }
     }
 
-    // Stagger threads 3s apart
-    const initialBatch = Math.min(threadCount, total);
-    for (let i = 0; i < initialBatch; i++) {
-      setTimeout(() => spawnWorker(), i * 3000);
+    // Stagger start 3s apart
+    for (let i = 0; i < Math.min(threadCount, total); i++) {
+      setTimeout(() => next(), i * 3000);
     }
   });
+
+  // Cleanup CycleTLS pool
+  for (const entry of tlsPool) {
+    try { await entry.tls.exit(); } catch {}
+  }
 }
 
 function printProgress(success, fail, completed, total) {
@@ -477,16 +614,15 @@ function printSummary(success, fail, total) {
   console.log(C.cyan + '═══════════════════════════════════════════' + C.reset);
 }
 
-// ── Autopay Mode ───────────────────────────────────────────────────────
+// ── Autopay Mode (Multi-Thread + Device Pool) ─────────────────────────
 
-async function runAutopayMode(proxies, gopayDevices) {
+async function runMultiThreadAutopay(proxies, gopayDevices, threadCount) {
   let payAccounts = fileWriter.getAccountsForAutopay();
   if (payAccounts.length === 0) {
     logger.error('Không có account nào có accessToken trong Account_ChatGPT_Data.xlsx');
     return;
   }
 
-  // Skip accounts already marked Plus (have Note column filled)
   const plusEmails = fileWriter.getPlusEmails();
   if (plusEmails.size > 0) {
     const before = payAccounts.length;
@@ -498,243 +634,362 @@ async function runAutopayMode(proxies, gopayDevices) {
       return;
     }
   }
-  logger.info('Tìm thấy ' + payAccounts.length + ' account cần autopay');
 
-  if (!gopayDevices || gopayDevices.length === 0) {
-    logger.error('Không có GoPay device nào. Rename MuMu instance thành PHONE_PIN.');
-    return;
-  }
-
+  const total = payAccounts.length;
+  const actualThreads = Math.min(threadCount, total);
   const gopayCountryCode = '62';
 
-
-
-  let successCount = 0;
-  const results = [];
-
-  for (let i = 0; i < payAccounts.length; i++) {
-    const acc = payAccounts[i];
-    const log = logger.withContext(i + 1, acc.email);
-
-    const device = gopayDevices[i % gopayDevices.length];
-    const gopayPhone = device.phone;
-    const gopayPin = device.pin;
-    const proxyUrl = proxies.length > 0 ? proxies[i % proxies.length] : null;
-
-
-
-    const autopay = new ChatGPTAutopay({
-      email: acc.email,
-      password: acc.password,
-      name: acc.email.split('@')[0],
-      accessToken: acc.accessToken,
-      skipLogin: true,
-      skipOtp: true,
-      proxyUrl: proxyUrl || null,
-      checkoutProxyUrl: proxyUrl || null,
-      gopayCountryCode,
-      gopayPhone,
-      gopayPin,
-      threadId: i + 1,
-      adbPath: process.env.MUMU_ADB_PATH || null,
-      deviceSerial: device.adbSerial || null,
-    });
-
-    try {
-      const result = await autopay.runAutopay();
-      if (result.success) {
-        log.success('ChatGPT Plus activated!');
-        await fileWriter.markAccountAsPlusInXlsx(acc.email);
-        successCount++;
-        results.push({ email: acc.email, status: 'SUCCESS', plan: 'Plus' });
-      } else {
-        if (!result.noRetry) {
-          log.error(result.error || 'Unknown error');
-        }
-        results.push({ email: acc.email, status: 'FAILED', error: result.error });
-      }
-    } catch (e) {
-      log.error(e.message);
-      results.push({ email: acc.email, status: 'ERROR', error: e.message });
-    }
-
-    if (i < payAccounts.length - 1) {
-      const wait = Math.floor(Math.random() * 3) + 3;
-      await new Promise(r => setTimeout(r, wait * 1000));
-    }
-  }
-
-  console.log('\n' + C.cyan + '═══════════════════════════════════════════' + C.reset);
-  console.log(C.bold + C.white + ' AUTOPAY DONE' + C.reset + ' ' + C.green + successCount + C.reset + '/' + C.yellow + payAccounts.length + C.reset + ' accounts upgraded');
-  console.log(C.cyan + '═══════════════════════════════════════════' + C.reset);
-
-  // Save results
-  try {
-    const fs = require('fs');
-    const lines = results.map(r => r.email + '|' + r.status + '|' + (r.error || r.plan || ''));
-    fs.writeFileSync(path.join(__dirname, '..', 'autopay_results.txt'), lines.join('\n'), 'utf8');
-    logger.info('Results saved → autopay_results.txt');
-  } catch {}
-}
-
-// ── Signup + Autopay Combined ──────────────────────────────────────────
-
-async function runSignupAndAutopay(accounts, proxies, gopayDevices) {
-  if (!gopayDevices || gopayDevices.length === 0) {
-    logger.error('Không có GoPay device nào. Rename MuMu instance thành PHONE_PIN.');
-    return;
-  }
-
-  const gopayCountryCode = '62';
-
-  printConfig(accounts, proxies, 'Signup + Autopay (1 thread)', 1);
-  console.log('  Devices     ' + C.green + gopayDevices.length + C.reset + ' (round-robin)');
+  console.log('  Mode        ' + C.green + 'Autopay Multi-Thread' + C.reset);
+  console.log('  Accounts    ' + C.yellow + total + C.reset);
+  console.log('  Threads     ' + C.yellow + actualThreads + C.reset);
+  console.log('  Devices     ' + C.green + gopayDevices.length + C.reset + C.gray + ' (max ' + gopayDevices.length + ' cùng lúc)' + C.reset);
+  console.log('  Proxies     ' + (proxies.length > 0 ? C.green + proxies.length : C.yellow + 'Direct') + C.reset);
   console.log(C.cyan + '───────────────────────────────────────' + C.reset);
   console.log('');
 
-  let cycleTLS = null;
-  try {
-    logger.info('Initializing CycleTLS...');
-    cycleTLS = await initCycleTLS();
-    registerCycleTLS(cycleTLS);
-    logger.success('CycleTLS ready');
+  const devicePool = new DevicePool(gopayDevices);
+  let successCount = 0;
+  let failCount = 0;
+  let completedCount = 0;
 
-    let signupSuccess = 0;
-    let signupFail = 0;
-    let autopaySuccess = 0;
-    let autopayFail = 0;
-    const registeredEmails = fileWriter.getRegisteredEmails();
+  // CycleTLS Pool
+  const poolSize = Math.max(2, Math.min(5, Math.ceil(actualThreads / 3)));
+  logger.info('Initializing CycleTLS pool (' + poolSize + ')...');
+  const tlsPool = [];
+  for (let i = 0; i < poolSize; i++) {
+    tlsPool.push({ tls: await initCycleTLS(), uses: 0, id: i });
+  }
+  let _poolRobin = 0;
+  const TLS_RECYCLE_AFTER = 10;
 
-    // Remove already-registered emails
-    if (registeredEmails.size > 0) {
-      const before = accounts.length;
-      for (const doneEmail of registeredEmails) {
-        fileWriter.removeFromHotmailXlsx(doneEmail, hotmailFile);
-      }
-      accounts = accounts.filter(a => !registeredEmails.has(a.email.toLowerCase().trim()));
-      const removed = before - accounts.length;
-      if (removed > 0) {
-        logger.warn('⚠️ Đã xóa ' + removed + ' email đã đăng ký khỏi danh sách (' + accounts.length + ' còn lại)');
-      }
-    }
+  function getTLS() {
+    const entry = tlsPool[_poolRobin % poolSize];
+    _poolRobin++;
+    return entry;
+  }
 
-    const total = accounts.length;
-
-    for (let i = 0; i < total; i++) {
-      const account = accounts[i];
-      const proxyUrl = proxies.length > 0 ? proxies[i % proxies.length] : null;
-      const log = logger.withContext(i + 1, account.email);
-
-
-
-      if (i > 0) {
-        const wait = Math.floor(Math.random() * 5) + 2;
-        log.info('Waiting ' + wait + 's...');
-        await new Promise(r => setTimeout(r, wait * 1000));
-      }
-
-      // ── PHASE 1: Signup ──
-      try {
-        const result = await runSingleSignup(account, proxyUrl, i + 1, cycleTLS);
-        if (result.success) {
-          const sessionData = result.sessionData || null;
-          const accessToken = result.accessToken || result.sessionData?.accessToken || '';
-
-          // Enable 2FA via API
-          let twoFaSecret = '';
-          if (accessToken) {
-            try {
-              const secret = await enable2FAAPI(accessToken, proxyUrl);
-              if (secret) {
-                twoFaSecret = secret;
-                log.success('[6/7] 2FA: ' + secret);
-              } else {
-                log.warn('[6/7] 2FA: không lấy được secret');
-              }
-            } catch (e) {
-              log.warn('[6/7] 2FA lỗi: ' + e.message);
-            }
-          }
-
-          fileWriter.writeResultToXlsx({
-            email: result.email,
-            chatgptPassword: password,
-            twoFa: twoFaSecret,
-            sessionData: sessionData,
-            hotmailInfo: account,
-            status: 'SUCCESS',
-          });
-          fileWriter.removeFromHotmailXlsx(account.email, hotmailFile);
-          registeredEmails.add(account.email.toLowerCase().trim());
-          log.success('[7/7] Signup hoàn tất');
-          signupSuccess++;
-
-          // ── PHASE 2: Autopay ngay sau signup ──
-          if (accessToken) {
-            const device = gopayDevices[i % gopayDevices.length];
-            const gopayPhone = device.phone;
-            const gopayPin = device.pin;
-
-            log.info('Autopay → device: +' + gopayCountryCode + gopayPhone);
-            try {
-              const autopay = new ChatGPTAutopay({
-                email: result.email,
-                password: password,
-                name: result.email.split('@')[0],
-                accessToken: accessToken,
-                skipLogin: true,
-                skipOtp: true,
-                proxyUrl: proxyUrl || null,
-                checkoutProxyUrl: proxyUrl || null,
-                gopayCountryCode,
-                gopayPhone,
-                gopayPin,
-                threadId: i + 1,
-                adbPath: process.env.MUMU_ADB_PATH || null,
-                deviceSerial: device.adbSerial || null,
-              });
-
-              const payResult = await autopay.runAutopay();
-              if (payResult.success) {
-                log.success('ChatGPT Plus activated!');
-                await fileWriter.markAccountAsPlusInXlsx(result.email);
-                autopaySuccess++;
-              } else {
-                log.error(payResult.error || 'Unknown error');
-                if (payResult.hint) log.warn(payResult.hint);
-                autopayFail++;
-              }
-            } catch (e) {
-              log.error(e.message);
-              autopayFail++;
-            }
-          } else {
-            log.warn('Bỏ qua autopay (không có accessToken)');
-            autopayFail++;
-          }
-
-        } else {
-          log.error(result.error);
-          signupFail++;
-        }
-      } catch (e) {
-        logger.error('[#' + (i + 1) + '] Fatal: ' + e.message);
-        signupFail++;
-      }
-    }
-
-    console.log('\n' + C.cyan + '═══════════════════════════════════════════' + C.reset);
-    console.log(C.bold + C.white + ' SIGNUP + AUTOPAY DONE' + C.reset);
-    console.log(C.cyan + '───────────────────────────────────────────' + C.reset);
-    console.log('  Signup   ' + C.green + signupSuccess + ' ✅' + C.reset + ' | ' + C.red + signupFail + ' ❌' + C.reset + ' / ' + C.yellow + total + C.reset);
-    console.log('  Autopay  ' + C.green + autopaySuccess + ' ✅' + C.reset + ' | ' + C.red + autopayFail + ' ❌' + C.reset + ' / ' + C.yellow + signupSuccess + C.reset);
-    console.log(C.cyan + '═══════════════════════════════════════════' + C.reset);
-  } finally {
-    if (cycleTLS) {
-      try { await cycleTLS.exit(); } catch {}
+  async function releaseTLS(entry) {
+    entry.uses++;
+    if (entry.uses >= TLS_RECYCLE_AFTER) {
+      try { await entry.tls.exit(); } catch {}
+      entry.tls = await initCycleTLS();
+      entry.uses = 0;
     }
   }
+
+  async function runOneAutopay(acc, proxyUrl, slot) {
+    const log = logger.withContext(slot, acc.email);
+    const tlsEntry = getTLS();
+    let device = null;
+
+    try {
+      log.info('⏳ Acquiring device...');
+      device = await devicePool.acquire();
+      log.info('📱 Device: +62' + device.phone + ' (idx=' + device.index + ')');
+
+      const autopay = new ChatGPTAutopay({
+        email: acc.email,
+        password: acc.password,
+        name: acc.email.split('@')[0],
+        accessToken: acc.accessToken,
+        skipLogin: true,
+        skipOtp: true,
+        proxyUrl: proxyUrl || null,
+        checkoutProxyUrl: proxyUrl || null,
+        gopayCountryCode,
+        gopayPhone: device.phone,
+        gopayPin: device.pin,
+        threadId: slot,
+        sharedCycleTLS: tlsEntry.tls,
+        adbPath: process.env.MUMU_ADB_PATH || null,
+        deviceSerial: device.adbSerial || null,
+      });
+
+      const result = await autopay.runAutopay();
+      if (result.success) {
+        log.success('✅ ChatGPT Plus activated!');
+        await fileWriter.markAccountAsPlusInXlsx(acc.email);
+        successCount++;
+      } else {
+        if (!result.noRetry) log.error(result.error || 'Unknown error');
+        if (result.hint) log.warn(result.hint);
+        failCount++;
+      }
+    } catch (e) {
+      log.error('💥 ' + e.message);
+      failCount++;
+    } finally {
+      completedCount++;
+      if (device) devicePool.release(device);
+      await releaseTLS(tlsEntry);
+      const rem = total - completedCount;
+      console.log(
+        C.gray + '  Progress: ' + C.reset +
+        C.green + successCount + ' ✅' + C.reset + ' | ' +
+        C.red + failCount + ' ❌' + C.reset + ' | ' +
+        C.yellow + rem + ' remaining' + C.reset +
+        ' (' + completedCount + '/' + total + ')'
+      );
+    }
+  }
+
+  // Semaphore: run N tasks concurrently
+  const running = new Set();
+  let taskIndex = 0;
+
+  await new Promise(resolve => {
+    function next() {
+      while (running.size < actualThreads && taskIndex < total) {
+        const idx = taskIndex++;
+        const slot = (idx % actualThreads) + 1;
+        const proxyUrl = proxies.length > 0 ? proxies[idx % proxies.length] : null;
+        const task = runOneAutopay(payAccounts[idx], proxyUrl, slot).then(() => {
+          running.delete(task);
+          if (taskIndex < total) next();
+          if (running.size === 0 && taskIndex >= total) resolve();
+        });
+        running.add(task);
+      }
+    }
+    for (let i = 0; i < Math.min(actualThreads, total); i++) {
+      setTimeout(() => next(), i * 2000);
+    }
+  });
+
+  // Cleanup CycleTLS pool
+  for (const entry of tlsPool) {
+    try { await entry.tls.exit(); } catch {}
+  }
+
+  console.log('\n' + C.cyan + '═══════════════════════════════════════════' + C.reset);
+  console.log(C.bold + C.white + ' AUTOPAY DONE' + C.reset);
+  console.log(C.cyan + '───────────────────────────────────────────' + C.reset);
+  console.log('  ' + C.green + '✅ Success    : ' + successCount + C.reset);
+  console.log('  ' + C.red + '❌ Failed     : ' + failCount + C.reset);
+  console.log('  ' + C.yellow + '  Total      : ' + total + C.reset);
+  console.log(C.cyan + '═══════════════════════════════════════════' + C.reset);
 }
+
+
+// ── Signup + Autopay Combined (Multi-Thread + Device Pool) ─────────────
+
+async function runMultiThreadSignupAutopay(accounts, proxies, gopayDevices, threadCount) {
+  if (!gopayDevices || gopayDevices.length === 0) {
+    logger.error('Không có GoPay device nào. Rename MuMu instance thành PHONE_PIN.');
+    return;
+  }
+
+  const gopayCountryCode = '62';
+  const registeredEmails = fileWriter.getRegisteredEmails();
+
+  // Remove already-registered emails
+  if (registeredEmails.size > 0) {
+    const before = accounts.length;
+    for (const doneEmail of registeredEmails) {
+      fileWriter.removeFromHotmailXlsx(doneEmail, hotmailFile);
+    }
+    accounts = accounts.filter(a => !registeredEmails.has(a.email.toLowerCase().trim()));
+    const removed = before - accounts.length;
+    if (removed > 0) {
+      logger.warn('⚠️ Đã xóa ' + removed + ' email đã đăng ký khỏi danh sách (' + accounts.length + ' còn lại)');
+    }
+  }
+
+  const total = accounts.length;
+  if (total === 0) {
+    logger.info('Không còn account nào cần xử lý.');
+    return;
+  }
+  const actualThreads = Math.min(threadCount, total);
+
+  console.log('  Mode        ' + C.green + 'Signup + Autopay Multi-Thread' + C.reset);
+  console.log('  Accounts    ' + C.yellow + total + C.reset);
+  console.log('  Threads     ' + C.yellow + actualThreads + C.reset);
+  console.log('  Devices     ' + C.green + gopayDevices.length + C.reset + C.gray + ' (max ' + gopayDevices.length + ' autopay cùng lúc)' + C.reset);
+  console.log('  Proxies     ' + (proxies.length > 0 ? C.green + proxies.length : C.yellow + 'Direct') + C.reset);
+  console.log('  Password    ' + C.gray + password.substring(0, 3) + '***' + C.reset);
+  console.log(C.cyan + '───────────────────────────────────────' + C.reset);
+  console.log('');
+
+  const devicePool = new DevicePool(gopayDevices);
+  let signupSuccess = 0;
+  let signupFail = 0;
+  let autopaySuccess = 0;
+  let autopayFail = 0;
+  let completedCount = 0;
+
+  // CycleTLS Pool
+  const poolSize = Math.max(2, Math.min(5, Math.ceil(actualThreads / 3)));
+  logger.info('Initializing CycleTLS pool (' + poolSize + ')...');
+  const tlsPool = [];
+  for (let i = 0; i < poolSize; i++) {
+    tlsPool.push({ tls: await initCycleTLS(), uses: 0, id: i });
+  }
+  let _poolRobin = 0;
+  const TLS_RECYCLE_AFTER = 10;
+
+  function getTLS() {
+    const entry = tlsPool[_poolRobin % poolSize];
+    _poolRobin++;
+    return entry;
+  }
+
+  async function releaseTLS(entry) {
+    entry.uses++;
+    if (entry.uses >= TLS_RECYCLE_AFTER) {
+      try { await entry.tls.exit(); } catch {}
+      entry.tls = await initCycleTLS();
+      entry.uses = 0;
+    }
+  }
+
+  async function runOneSignupAutopay(account, proxyUrl, slot) {
+    const log = logger.withContext(slot, account.email);
+    const tlsEntry = getTLS();
+    const cycleTLS = tlsEntry.tls;
+
+    try {
+      // ── PHASE 1: Signup (NO device needed) ──
+      log.info('📧 Bắt đầu Signup...');
+      const signupResult = await runSingleSignup(account, proxyUrl, slot, cycleTLS);
+
+      if (!signupResult.success) {
+        log.error(signupResult.error);
+        signupFail++;
+        return;
+      }
+
+      const accessToken = signupResult.accessToken || signupResult.sessionData?.accessToken || '';
+
+      // Enable 2FA
+      let twoFaSecret = '';
+      if (accessToken) {
+        try {
+          const secret = await enable2FAAPI(accessToken, proxyUrl, account.email, cycleTLS);
+          if (secret) {
+            twoFaSecret = secret;
+            log.success('[6/7] 🔐 2FA: ' + secret);
+          } else {
+            log.warn('[6/7] ⚠️ 2FA failed');
+          }
+        } catch (e) {
+          log.error('[6/7] ❌ 2FA: ' + e.message);
+        }
+      }
+
+      fileWriter.writeResultToXlsx({
+        email: signupResult.email,
+        chatgptPassword: password,
+        twoFa: twoFaSecret,
+        sessionData: signupResult.sessionData || null,
+        hotmailInfo: account,
+        status: 'SUCCESS',
+      });
+      fileWriter.removeFromHotmailXlsx(account.email, hotmailFile);
+      registeredEmails.add(account.email.toLowerCase().trim());
+      log.success('[7/7] Signup hoàn tất');
+      signupSuccess++;
+
+      // ── PHASE 2: Autopay (NEEDS device) ──
+      if (!accessToken) {
+        log.warn('Bỏ qua autopay (không có accessToken)');
+        autopayFail++;
+        return;
+      }
+
+      let device = null;
+      try {
+        log.info('⏳ Acquiring device for autopay...');
+        device = await devicePool.acquire();
+        log.info('📱 Autopay → device: +' + gopayCountryCode + device.phone);
+
+        const autopay = new ChatGPTAutopay({
+          email: signupResult.email,
+          password: password,
+          name: signupResult.email.split('@')[0],
+          accessToken: accessToken,
+          skipLogin: true,
+          skipOtp: true,
+          proxyUrl: proxyUrl || null,
+          checkoutProxyUrl: proxyUrl || null,
+          gopayCountryCode,
+          gopayPhone: device.phone,
+          gopayPin: device.pin,
+          threadId: slot,
+          sharedCycleTLS: cycleTLS,
+          adbPath: process.env.MUMU_ADB_PATH || null,
+          deviceSerial: device.adbSerial || null,
+        });
+
+        const payResult = await autopay.runAutopay();
+        if (payResult.success) {
+          log.success('✅ ChatGPT Plus activated!');
+          await fileWriter.markAccountAsPlusInXlsx(signupResult.email);
+          autopaySuccess++;
+        } else {
+          log.error(payResult.error || 'Unknown error');
+          if (payResult.hint) log.warn(payResult.hint);
+          autopayFail++;
+        }
+      } catch (e) {
+        log.error('💥 Autopay: ' + e.message);
+        autopayFail++;
+      } finally {
+        if (device) devicePool.release(device);
+      }
+    } catch (e) {
+      log.error('💥 Fatal: ' + e.message);
+      signupFail++;
+    } finally {
+      completedCount++;
+      await releaseTLS(tlsEntry);
+      console.log(
+        C.gray + '  Progress: ' + C.reset +
+        C.green + 'Signup ' + signupSuccess + '✅' + C.reset + ' | ' +
+        C.red + signupFail + '❌' + C.reset + ' | ' +
+        C.green + 'Autopay ' + autopaySuccess + '✅' + C.reset + ' | ' +
+        C.red + autopayFail + '❌' + C.reset +
+        ' (' + completedCount + '/' + total + ')'
+      );
+    }
+  }
+
+  // Semaphore: run N tasks concurrently
+  const running = new Set();
+  let taskIndex = 0;
+
+  await new Promise(resolve => {
+    function next() {
+      while (running.size < actualThreads && taskIndex < total) {
+        const idx = taskIndex++;
+        const slot = (idx % actualThreads) + 1;
+        const proxyUrl = proxies.length > 0 ? proxies[idx % proxies.length] : null;
+        const task = runOneSignupAutopay(accounts[idx], proxyUrl, slot).then(() => {
+          running.delete(task);
+          if (taskIndex < total) next();
+          if (running.size === 0 && taskIndex >= total) resolve();
+        });
+        running.add(task);
+      }
+    }
+    for (let i = 0; i < Math.min(actualThreads, total); i++) {
+      setTimeout(() => next(), i * 3000);
+    }
+  });
+
+  // Cleanup CycleTLS pool
+  for (const entry of tlsPool) {
+    try { await entry.tls.exit(); } catch {}
+  }
+
+  console.log('\n' + C.cyan + '═══════════════════════════════════════════' + C.reset);
+  console.log(C.bold + C.white + ' SIGNUP + AUTOPAY DONE' + C.reset);
+  console.log(C.cyan + '───────────────────────────────────────────' + C.reset);
+  console.log('  Signup   ' + C.green + signupSuccess + ' ✅' + C.reset + ' | ' + C.red + signupFail + ' ❌' + C.reset + ' / ' + C.yellow + total + C.reset);
+  console.log('  Autopay  ' + C.green + autopaySuccess + ' ✅' + C.reset + ' | ' + C.red + autopayFail + ' ❌' + C.reset + ' / ' + C.yellow + signupSuccess + C.reset);
+  console.log(C.cyan + '═══════════════════════════════════════════' + C.reset);
+}
+
 
 // ── Get Stripe Payment Links ──────────────────────────────────────────
 
@@ -928,8 +1183,8 @@ async function main() {
   console.log(B + '  ║' + R + padV('   [1]  🚀  Đăng ký tuần tự (1 luồng)', W) + B + '║' + R);
   console.log(B + '  ║' + R + padV('   [2]  ⚡  Đăng ký đa luồng', W) + B + '║' + R);
   console.log(B + '  ╟' + dash + '╢' + R);
-  console.log(B + '  ║' + gS + padV('   [3]  💳  Thanh toán GoPay (Autopay)', W) + gE + B + '║' + R);
-  console.log(B + '  ║' + gS + padV('   [4]  🔥  Signup + Autopay tự động', W) + gE + B + '║' + R);
+  console.log(B + '  ║' + gS + padV('   [3]  💳  Thanh toán GoPay (Autopay đa luồng)', W) + gE + B + '║' + R);
+  console.log(B + '  ║' + gS + padV('   [4]  🔥  Signup + Autopay đa luồng', W) + gE + B + '║' + R);
   console.log(B + '  ╟' + dash + '╢' + R);
   console.log(B + '  ║' + R + padV('   [5]  💳  Get link Stripe Payment', W) + B + '║' + R);
   console.log(B + '  ╟' + dash + '╢' + R);
@@ -973,13 +1228,18 @@ async function main() {
       console.log(C.red + '  ❌ GoPay không khả dụng! Cần rename MuMu instances sang PHONE_PIN.' + R);
       return;
     }
-    await runAutopayMode(proxies, gopayDevices);
+    const threadInput = await getUserInput('Số luồng (VD: 3, 5, 10 — max cùng lúc = ' + gopayDevices.length + ' devices): ');
+    const threadCount = parseInt(threadInput) || gopayDevices.length;
+    await runMultiThreadAutopay(proxies, gopayDevices, threadCount);
   } else if (choice === '4') {
     if (!hasGopay) {
       console.log(C.red + '  ❌ GoPay không khả dụng! Cần rename MuMu instances sang PHONE_PIN.' + R);
       return;
     }
-    await runSignupAndAutopay(accounts, proxies, gopayDevices);
+    const threadInput = await getUserInput('Số luồng (VD: 3, 5, 10 — max autopay cùng lúc = ' + gopayDevices.length + ' devices): ');
+    const threadCount = parseInt(threadInput) || gopayDevices.length;
+    await runMultiThreadSignupAutopay(accounts, proxies, gopayDevices, threadCount);
+
   } else if (choice === '5') {
     await runGetStripeLinks(proxies);
   } else {
