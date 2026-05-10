@@ -1,0 +1,7 @@
+node_modules/
+.env
+*.xlsx
+session.json
+_rmlog.js
+_fix.js
+.agent/

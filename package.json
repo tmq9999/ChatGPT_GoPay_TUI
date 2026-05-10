@@ -1,0 +1,39 @@
+{
+  "name": "chatgpt-auto-signup",
+  "version": "2.0.0",
+  "description": "ChatGPT Auto Signup Tool — Modified By TMQ cui bap",
+  "author": "TMQ cui bap",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "build": "npx pkg src/index.js --targets node18-win-x64 --output dist/chatgpt-signup.exe",
+    "test": "node src/utils/emailGenerator.js"
+  },
+  "pkg": {
+    "assets": [
+      "src/**/*"
+    ],
+    "outputPath": "dist"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "axios-cookiejar-support": "^4.0.0",
+    "camoufox": "^0.1.19",
+    "cycletls": "^2.0.5",
+    "dotenv": "^16.4.0",
+    "exceljs": "^4.4.0",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.6",
+    "playwright": "^1.59.1",
+    "puppeteer": "^24.40.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "tough-cookie": "^4.1.0",
+    "uuid": "^9.0.0",
+    "ws": "^8.14.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "javascript-obfuscator": "^5.3.0"
+  }
+}
